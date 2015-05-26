@@ -4,7 +4,7 @@
 
 # TODO:
 # Ability to set CPU/Memory reservations
-
+import re
 try:
     import json
 except ImportError:
@@ -244,6 +244,7 @@ EXAMPLES = '''
     state: absent
     force: yes
 '''
+
 
 def add_scsi_controller(module, s, config, devices, type="paravirtual", bus_num=0, disk_ctrl_key=1):
     # add a scsi controller
@@ -570,7 +571,7 @@ def reconfigure_vm(vsphere_client, vm, module, esxi, resource_pool, cluster_name
     cpuHotRemoveEnabled = bool(vm.properties.config.cpuHotRemoveEnabled)
 
     # Change Memory
-    if vm_hardware['memory_mb']:
+    if 'memory_mb' in vm_hardware:
 
         if int(vm_hardware['memory_mb']) != vm.properties.config.hardware.memoryMB:
             spec = spec_singleton(spec, request, vm)
@@ -600,7 +601,7 @@ def reconfigure_vm(vsphere_client, vm, module, esxi, resource_pool, cluster_name
             changes['memory'] = vm_hardware['memory_mb']
 
     # ====( Config Memory )====#
-    if vm_hardware['num_cpus']:
+    if 'num_cpus' in vm_hardware:
         if int(vm_hardware['num_cpus']) != vm.properties.config.hardware.numCPU:
             spec = spec_singleton(spec, request, vm)
 
@@ -630,8 +631,14 @@ def reconfigure_vm(vsphere_client, vm, module, esxi, resource_pool, cluster_name
 
             changes['cpu'] = vm_hardware['num_cpus']
 
-    if len(changes):
+    # Update Disk set
+    if vm_disk:
+        spec = spec_singleton(spec, request, vm)
+        spec, changes = _update_disk_set(vm, vm_disk, spec, module, vsphere_client, vm_hardware)
 
+    if len(changes):
+        # Exiting with changes array to see what we are trying to do
+        # module.fail_json(msg=json.dumps(changes))
         if shutdown and vm.is_powered_on():
             try:
                 vm.power_off(sync_run=True)
@@ -669,18 +676,273 @@ def reconfigure_vm(vsphere_client, vm, module, esxi, resource_pool, cluster_name
     module.exit_json(changed=False)
 
 
-def create_vm(vsphere_client, module, esxi, resource_pool, cluster_name, guest, vm_extra_config, vm_hardware, vm_disk, vm_nic, vm_hw_version, state):
+def _get_defined_disk_info(disk, vm_disk):
+    datastore = None
+    disk_size = None
+    disk_type = None
 
-    datacenter = esxi['datacenter']
-    esxi_hostname = esxi['hostname']
-    # Datacenter managed object reference
+    try:
+        datastore = vm_disk[disk]['datastore']
+    except KeyError:
+        vsphere_client.disconnect()
+        module.fail_json(
+            msg="Error on %s definition. datastore needs to be"
+                " specified." % disk)
+    try:
+        disk_size = int(vm_disk[disk]['size_gb'])
+        disk_size = disk_size
+    except (KeyError, ValueError):
+        vsphere_client.disconnect()
+        module.fail_json(msg="Error on %s definition. size needs to be specified as an integer." % disk)
+    try:
+        disk_type = vm_disk[disk]['type']
+    except KeyError:
+        vsphere_client.disconnect()
+        module.fail_json(
+            msg="Error on %s definition. type needs to be"
+                " specified." % disk)
+
+    return {"datastore": datastore,
+            "size_gb": disk_size,
+            "type": disk_type,
+            "label": disk}
+
+
+def _get_vm_disk_info(disk):
+    datastore = None
+
+    try:
+        disk_full_name = disk['files'][0]["name"]
+        rgx = re.compile("\[(.*)\]")
+        match = rgx.match(disk_full_name)
+        if match:
+            datastore = match.group(1)
+    except KeyError:
+        module.fail_json(
+            msg="Error getting information from vCenter for disk %s." % disk.label
+        )
+
+    disk_size = disk["capacity"]
+    disk_label = disk["label"]
+    disk_key = disk["device"]["key"]
+    disk_unit = disk["device"]["unitNumber"]
+
+    return {"datastore": datastore,
+            "size_gb": disk_size / 1024 / 1024,
+            "label": disk_label,
+            "controller_key": disk_key,
+            "unit_number": disk_unit}
+
+
+def _map_disk_sets(set1, set2):
+    labels1 = sorted([_index_label_map(ind, l["label"]) for ind, l in enumerate(set1)])
+    labels2 = sorted([_index_label_map(ind, l["label"]) for ind, l in enumerate(set2)])
+    return labels1, labels2
+
+
+def _disk_labels_match(label1, label2):
+    return _number_from_disk_label(label1) == _number_from_disk_label(label2)
+
+
+def _index_label_map(index, label):
+    '''
+    Returns Tuple(index, diskNumber, label)
+    '''
+    return index, _number_from_disk_label(label), label
+
+
+def _number_from_disk_label(label):
+    rgx = re.compile("disk\s?(\d+)")
+    num = rgx.search(label)
+    if num:
+        return num.group(1)
+    else:
+        return None
+
+
+def _update_disk_set(vm, desired_disks, spec, module, vsphere_client, vm_hardware):
+    current_disks = [dsk for dsk in vm._disks]
+    vm_disk_details = [_get_vm_disk_info(v_dsk) for v_dsk in current_disks]
+    desired_disk_details = [_get_defined_disk_info(def_disk, desired_disks) for def_disk in
+                            sorted(desired_disks.iterkeys())]
+
+    hfmor = _get_dc_mor_from_vm(vm).hostFolder._obj
+    hostmor = vm.properties.runtime.host._obj
+    crmor = _get_host_compute_resource_mor(vsphere_client, hostmor, hfmor)
+    crprops = VIProperty(vsphere_client, crmor)
+
+    config_target = _get_config_target(crprops, hostmor, vsphere_client)
+    return _compare_disk_sets(vm_disk_details, desired_disk_details, spec, config_target,  module, vsphere_client, vm_hardware)
+
+
+def _tuple_disks_lookup(tuple_list, disk_list, disk_nums):
+    results = [[disk_list[t[0]] for t in tuple_list if t[1] == d][0] for d in disk_nums]
+    if results is None:
+        return []
+    else:
+        return results
+
+
+def _tuple_disk_lookup(tuple_list, disk_list, disk_num):
+    results = [disk_list[t[0]] for t in tuple_list if t[1] == disk_num]
+    if len(results) > 0:
+        return results[0]
+    else:
+        return None
+
+
+def _compare_disks(vm_disk, desired_disk, spec, changes):
+    changed = False
+    dc = spec.new_deviceChange()
+    dc.Operation = "edit"
+    hd = VI.ns0.VirtualDisk_Def("hd").pyclass()
+    hd.Key = -100
+    hd.UnitNumber = vm_disk["unit_number"]
+    hd.ControllerKey = vm_disk["controller_key"]
+
+    if not _disk_labels_match(vm_disk["label"], desired_disk["label"]):
+        return spec, {}
+    if vm_disk["size_gb"] != desired_disk["size_gb"]:
+        changes[vm_disk["label"]] = {"size_gb": desired_disk["size_gb"]}
+        changed = True
+        hd.CapacityInKB = desired_disk["size_gb"] * 1024 * 1024
+    # Just not going to support moving datastores right now
+    # if vm_disk["datastore"] != desired_disk["datastore"]:
+    #     if changed:
+    #         changes[vm_disk["label"]]["datastore"] = desired_disk["datastore"]
+    #     else:
+    #         changes[vm_disk["label"]] = {"datastore": desired_disk["datastore"]}
+    if changed:
+        dc.Device = hd
+        if hasattr(spec, "DeviceChange"):
+            spec.DeviceChange.push(dc)
+        else:
+            spec.DeviceChange = [dc]
+
+    return spec, changes
+
+
+def _convert_disk_list_to_dict(disks):
+    disk_dict = {}
+    for disk in range(len(disks)):
+        disk_dict[disks[disk]["label"]] = disks[disk]
+    return disk_dict
+
+
+def _compare_disk_sets(vm_disks, desired_disks, spec, config_target, module, vsphere_client, vm_hardware):
+    desired_count = len(desired_disks)
+    changes = {}
+    if desired_count < 1:
+        module.fail_json(
+            msg="Error. You must have at least one disk. Remove vm_disk if you don't want to change your configuration."
+        )
+    labels1, labels2 = _map_disk_sets(vm_disks, desired_disks)
+    label1_set = set([x[1] for x in labels1])
+    label2_set = set([y[1] for y in labels2])
+    compare_labels = label1_set.intersection(label2_set)
+    new_labels = label2_set - compare_labels
+    new_disk_list = _tuple_disks_lookup(labels2, desired_disks, new_labels)
+    compare_disk_list = zip(_tuple_disks_lookup(labels1, vm_disks, compare_labels),
+                            _tuple_disks_lookup(labels2, desired_disks, compare_labels))
+
+    for disk_tuple in compare_disk_list:
+        spec, changes = _compare_disks(disk_tuple[0], disk_tuple[1], spec, changes)
+
+    new_disk_dict = _convert_disk_list_to_dict(new_disk_list)
+    changes.update(new_disk_dict)
+
+    next_unit = vm_disks[-1]["unit_number"] + 1
+    devices = []
+    _add_vm_disks(module,
+                  vsphere_client,
+                  spec,
+                  config_target,
+                  devices,
+                  vm_hardware,
+                  new_disk_dict,
+                  next_unit)
+    if hasattr(spec, "DeviceChange"):
+        spec.DeviceChange += devices
+    else:
+        spec.DeviceChange = devices
+
+    return spec, changes
+
+
+def _get_config_target(crprops, hostmor, vsphere_client):
+    # get config target
+    request = VI.QueryConfigTargetRequestMsg()
+    _this = request.new__this(crprops.environmentBrowser._obj)
+    _this.set_attribute_type(
+        crprops.environmentBrowser._obj.get_attribute_type())
+    request.set_element__this(_this)
+    h = request.new_host(hostmor)
+    h.set_attribute_type(hostmor.get_attribute_type())
+    request.set_element_host(h)
+    config_target = vsphere_client._proxy.QueryConfigTarget(request)._returnval
+    return config_target
+
+
+def _get_dc_mor(datacenter):
     dclist = [k for k,
              v in vsphere_client.get_datacenters().items() if v == datacenter]
     if dclist:
         dcmor=dclist[0]
+        return dcmor
     else:
         vsphere_client.disconnect()
         module.fail_json(msg="Cannot find datacenter named: %s" % datacenter)
+        return None
+
+
+def _get_esx_host_mor(esxi_hostname):
+    try:
+        hostmor = [k for k,
+                   v in vsphere_client.get_hosts().items() if v == esxi_hostname][0]
+    except IndexError, e:
+        vsphere_client.disconnect()
+        module.fail_json(msg="Cannot find esx host named: %s" % esxi_hostname)
+
+    return hostmor
+
+
+def _get_host_compute_resource_mor(vsphere_client, hostmor, hfmor):
+    # Grab the computerResource name and host properties
+    crmors = vsphere_client._retrieve_properties_traversal(
+        property_names=['name', 'host'],
+        from_node=hfmor,
+        obj_type='ComputeResource')
+    crmor = None
+    for cr in crmors:
+        for p in cr.PropSet:
+            if p.Name == "host":
+                for h in p.Val.get_element_ManagedObjectReference():
+                    if h == hostmor:
+                        return cr.Obj
+                if crmor:
+                    break
+    return crmor
+
+
+def _get_dc_mor_from_vm(vm):
+    parent = vm.properties.parent
+    parent_name = parent.name
+    current_mor = None
+    while parent_name != "Datacenters":
+        current_mor = parent
+        if hasattr(parent, "parent"):
+            parent = parent.parent
+            parent_name = parent.name
+        else:
+            break
+    return current_mor
+
+
+def create_vm(vsphere_client, module, esxi, resource_pool, cluster_name, guest, vm_extra_config, vm_hardware, vm_disk, vm_nic, vm_hw_version, state):
+    datacenter = esxi['datacenter']
+    esxi_hostname = esxi['hostname']
+    # Datacenter managed object reference
+    dcmor = _get_dc_mor(datacenter)
 
     dcprops = VIProperty(vsphere_client, dcmor)
 
@@ -702,34 +964,12 @@ def create_vm(vsphere_client, module, esxi, resource_pool, cluster_name, guest, 
     # networkFolder managed object reference
     nfmor = dcprops.networkFolder._obj
 
-    # Grab the computerResource name and host properties
-    crmors = vsphere_client._retrieve_properties_traversal(
-        property_names=['name', 'host'],
-        from_node=hfmor,
-        obj_type='ComputeResource')
-
     # Grab the host managed object reference of the esxi_hostname
-    try:
-        hostmor = [k for k,
-                   v in vsphere_client.get_hosts().items() if v == esxi_hostname][0]
-    except IndexError, e:
-        vsphere_client.disconnect()
-        module.fail_json(msg="Cannot find esx host named: %s" % esxi_hostname)
+    hostmor = _get_esx_host(esxi_hostname)
 
     # Grab the computerResource managed object reference of the host we are
     # creating the VM on.
-    crmor = None
-    for cr in crmors:
-        if crmor:
-            break
-        for p in cr.PropSet:
-            if p.Name == "host":
-                for h in p.Val.get_element_ManagedObjectReference():
-                    if h == hostmor:
-                        crmor = cr.Obj
-                        break
-                if crmor:
-                    break
+    crmor = _get_host_compute_resource_mor(vsphere_client, hostmor, hfmor)
     crprops = VIProperty(vsphere_client, crmor)
 
     # Get resource pool managed reference
@@ -756,16 +996,7 @@ def create_vm(vsphere_client, module, esxi, resource_pool, cluster_name, guest, 
         rpmor = crprops.resourcePool._obj
 
     # CREATE VM CONFIGURATION
-    # get config target
-    request = VI.QueryConfigTargetRequestMsg()
-    _this = request.new__this(crprops.environmentBrowser._obj)
-    _this.set_attribute_type(
-        crprops.environmentBrowser._obj.get_attribute_type())
-    request.set_element__this(_this)
-    h = request.new_host(hostmor)
-    h.set_attribute_type(hostmor.get_attribute_type())
-    request.set_element_host(h)
-    config_target = vsphere_client._proxy.QueryConfigTarget(request)._returnval
+    config_target = _get_config_target(crprops, hostmor, vsphere_client)
 
     # get default devices
     request = VI.QueryConfigOptionRequestMsg()
@@ -797,42 +1028,9 @@ def create_vm(vsphere_client, module, esxi, resource_pool, cluster_name, guest, 
     config.set_element_guestId(vm_hardware['osid'])
     devices = []
 
-    # Attach all the hardware we want to the VM spec.
-    # Add a scsi controller to the VM spec.
-    disk_ctrl_key = add_scsi_controller(
-        module, vsphere_client, config, devices, vm_hardware['scsi'])
     if vm_disk:
-        disk_num = 0
-        disk_key = 0
-        for disk in sorted(vm_disk.iterkeys()):
-            try:
-                datastore = vm_disk[disk]['datastore']
-            except KeyError:
-                vsphere_client.disconnect()
-                module.fail_json(
-                    msg="Error on %s definition. datastore needs to be"
-                    " specified." % disk)
-            try:
-                disksize = int(vm_disk[disk]['size_gb'])
-                # Convert the disk size to kiloboytes
-                disksize = disksize * 1024 * 1024
-            except (KeyError, ValueError):
-                vsphere_client.disconnect()
-                module.fail_json(msg="Error on %s definition. size needs to be specified as an integer." % disk)
-            try:
-                disktype = vm_disk[disk]['type']
-            except KeyError:
-                vsphere_client.disconnect()
-                module.fail_json(
-                    msg="Error on %s definition. type needs to be"
-                    " specified." % disk)
-            # Add the disk  to the VM spec.
-            add_disk(
-                module, vsphere_client, config_target, config,
-                devices, datastore, disktype, disksize, disk_ctrl_key,
-                disk_num, disk_key)
-            disk_num = disk_num + 1
-            disk_key = disk_key + 1
+        _add_vm_disks(module, vsphere_client, config, config_target, devices, vm_hardware, vm_disk)
+
     if 'vm_cdrom' in vm_hardware:
         cdrom_iso_path = None
         cdrom_type = None
@@ -918,6 +1116,42 @@ def create_vm(vsphere_client, module, esxi, resource_pool, cluster_name, guest, 
             ansible_facts=gather_facts(vm),
             changed=True,
             changes="Created VM %s" % guest)
+
+
+def _add_vm_disks(module, vsphere_client, config, config_target, devices, vm_hardware, vm_disk, start_key=0):
+    disk_ctrl_key = add_scsi_controller(
+        module, vsphere_client, config, devices, vm_hardware['scsi'], start_key)
+    disk_num = start_key
+    disk_key = start_key
+    for disk in sorted(vm_disk.iterkeys()):
+        try:
+            datastore = vm_disk[disk]['datastore']
+        except KeyError:
+            vsphere_client.disconnect()
+            module.fail_json(
+                msg="Error on %s definition. datastore needs to be"
+                " specified." % disk)
+        try:
+            disksize = int(vm_disk[disk]['size_gb'])
+            # Convert the disk size to kiloboytes
+            disksize = disksize * 1024 * 1024
+        except (KeyError, ValueError):
+            vsphere_client.disconnect()
+            module.fail_json(msg="Error on %s definition. size needs to be specified as an integer." % disk)
+        try:
+            disktype = vm_disk[disk]['type']
+        except KeyError:
+            vsphere_client.disconnect()
+            module.fail_json(
+                msg="Error on %s definition. type needs to be"
+                " specified." % disk)
+        # Add the disk  to the VM spec.
+        add_disk(
+            module, vsphere_client, config_target, config,
+            devices, datastore, disktype, disksize, disk_ctrl_key,
+            disk_num, disk_key)
+        disk_num = disk_num + 1
+        disk_key = disk_key + 1
 
 
 def delete_vm(vsphere_client, module, guest, vm, force):
