@@ -194,6 +194,33 @@ EXAMPLES = '''
       datacenter: MyDatacenter
       hostname: esx001.mydomain.local
 
+# Reconfigure a VM and add disks to it
+Task File:
+- name: Add VCenter Disk
+  cdk_vsphere_guest:
+    vcenter_hostname: "{{vcenter}}"
+    username: "{{vcenter_account}}"
+    password: "{{vcenter_pass}}"
+    guest: "{{guest_name}}"
+    state: reconfigured
+    force: "{{ force }}"
+    vm_hardware:
+      scsi: paravirtual
+    vm_disk: "{{ disk_definition }}"
+
+disk_definition and datastores defined in vars
+
+vars File:
+disk_definition:
+  disk1:
+    size_gb: 2
+    type: thick
+    datastore: "{{datastore_1}}"
+  disk2:
+    size_gb: 2
+    type: thick
+    datastore: "{{datastore_2}}"
+
 # Deploy a guest from a template
 # No reconfiguration of the destination guest is done at this stage, a reconfigure would be needed to adjust memory/cpu etc..
 - vsphere_guest:
@@ -634,11 +661,13 @@ def reconfigure_vm(vsphere_client, vm, module, esxi, resource_pool, cluster_name
     # Update Disk set
     if vm_disk:
         spec = spec_singleton(spec, request, vm)
-        spec, changes = _update_disk_set(vm, vm_disk, spec, module, vsphere_client, vm_hardware)
+        spec, changes, restart_needed = _update_disk_set(vm, vm_disk, spec, module, vsphere_client, vm_hardware)
+        if restart_needed and not force:
+            module.fail_json(msg="Cannot add scsi controller without restart. force is required for restart.")
+        else:
+            shutdown = restart_needed
 
     if len(changes):
-        # Exiting with changes array to see what we are trying to do
-        # module.fail_json(msg=json.dumps(changes))
         if shutdown and vm.is_powered_on():
             try:
                 vm.power_off(sync_run=True)
@@ -671,7 +700,7 @@ def reconfigure_vm(vsphere_client, vm, module, esxi, resource_pool, cluster_name
 
     vsphere_client.disconnect()
     if changed:
-        module.exit_json(changed=True, changes=changes)
+        module.exit_json(changed=True, changes=json.dumps(changes))
 
     module.exit_json(changed=False)
 
@@ -772,7 +801,7 @@ def _update_disk_set(vm, desired_disks, spec, module, vsphere_client, vm_hardwar
     crprops = VIProperty(vsphere_client, crmor)
 
     config_target = _get_config_target(crprops, hostmor, vsphere_client)
-    return _compare_disk_sets(vm_disk_details, desired_disk_details, spec, config_target,  module, vsphere_client, vm_hardware)
+    return _compare_disk_sets(vm_disk_details, desired_disk_details, spec, config_target,  module, vsphere_client, vm_hardware, vm)
 
 
 def _tuple_disks_lookup(tuple_list, disk_list, disk_nums):
@@ -829,44 +858,49 @@ def _convert_disk_list_to_dict(disks):
     return disk_dict
 
 
-def _compare_disk_sets(vm_disks, desired_disks, spec, config_target, module, vsphere_client, vm_hardware):
+def _compare_disk_sets(vm_disks, desired_disks, spec, config_target, module, vsphere_client, vm_hardware, vm):
     desired_count = len(desired_disks)
     changes = {}
     if desired_count < 1:
         module.fail_json(
             msg="Error. You must have at least one disk. Remove vm_disk if you don't want to change your configuration."
         )
-    labels1, labels2 = _map_disk_sets(vm_disks, desired_disks)
-    label1_set = set([x[1] for x in labels1])
-    label2_set = set([y[1] for y in labels2])
-    compare_labels = label1_set.intersection(label2_set)
-    new_labels = label2_set - compare_labels
-    new_disk_list = _tuple_disks_lookup(labels2, desired_disks, new_labels)
-    compare_disk_list = zip(_tuple_disks_lookup(labels1, vm_disks, compare_labels),
-                            _tuple_disks_lookup(labels2, desired_disks, compare_labels))
 
-    for disk_tuple in compare_disk_list:
-        spec, changes = _compare_disks(disk_tuple[0], disk_tuple[1], spec, changes)
+    # Disabling Comparisons until resizing works. This means all dictionary objects just add new disks.
+    # labels1, labels2 = _map_disk_sets(vm_disks, desired_disks)
+    # label1_set = set([x[1] for x in labels1])
+    # label2_set = set([y[1] for y in labels2])
+    # compare_labels = label1_set.intersection(label2_set)
+    # new_labels = label2_set - compare_labels
+    # new_disk_list = _tuple_disks_lookup(labels2, desired_disks, new_labels)
+    # compare_disk_list = zip(_tuple_disks_lookup(labels1, vm_disks, compare_labels),
+    #                         _tuple_disks_lookup(labels2, desired_disks, compare_labels))
+    #
+    # for disk_tuple in compare_disk_list:
+    #     spec, changes = _compare_disks(disk_tuple[0], disk_tuple[1], spec, changes)
 
-    new_disk_dict = _convert_disk_list_to_dict(new_disk_list)
+    # new_disk_dict = _convert_disk_list_to_dict(new_disk_list)
+    new_disk_dict = _convert_disk_list_to_dict(desired_disks)
+
     changes.update(new_disk_dict)
 
     next_unit = vm_disks[-1]["unit_number"] + 1
     devices = []
-    _add_vm_disks(module,
-                  vsphere_client,
-                  spec,
-                  config_target,
-                  devices,
-                  vm_hardware,
-                  new_disk_dict,
-                  next_unit)
+    restart_needed = _add_vm_disks(module,
+                                   vsphere_client,
+                                   spec,
+                                   config_target,
+                                   devices,
+                                   vm_hardware,
+                                   new_disk_dict,
+                                   next_unit,
+                                   vm)
     if hasattr(spec, "DeviceChange"):
         spec.DeviceChange += devices
     else:
         spec.DeviceChange = devices
 
-    return spec, changes
+    return spec, changes, restart_needed
 
 
 def _get_config_target(crprops, hostmor, vsphere_client):
@@ -937,6 +971,9 @@ def _get_dc_mor_from_vm(vm):
             break
     return current_mor
 
+
+def _get_scsi_controllers(vm):
+    return [x for x in vm.properties.config.hardware.device if "SCSI" in x.deviceInfo.summary]
 
 def create_vm(vsphere_client, module, esxi, resource_pool, cluster_name, guest, vm_extra_config, vm_hardware, vm_disk, vm_nic, vm_hw_version, state):
     datacenter = esxi['datacenter']
@@ -1118,11 +1155,34 @@ def create_vm(vsphere_client, module, esxi, resource_pool, cluster_name, guest, 
             changes="Created VM %s" % guest)
 
 
-def _add_vm_disks(module, vsphere_client, config, config_target, devices, vm_hardware, vm_disk, start_key=0):
-    disk_ctrl_key = add_scsi_controller(
-        module, vsphere_client, config, devices, vm_hardware['scsi'], start_key)
+def _add_vm_disks(module, vsphere_client, config, config_target, devices, vm_hardware, vm_disk, start_key=0, vm=None):
+    restart_needed = False
+    scsi_controllers = None
+    controller_capacity = None
+    next_controller = 0
+    scsi_key = 0
+
+    if vm is not None:
+        # Must not be a new VM, let's go map scsi devices to controllers
+        scsi_controllers = _get_scsi_controllers(vm)
+
+    if scsi_controllers is not None and len(scsi_controllers) > 0:
+        controller_capacity = [x for x in scsi_controllers if vm_hardware['scsi'] in x.deviceInfo.summary and len(x.device) < 13]
+        if len(controller_capacity) > 0:
+            disk_ctrl_key = controller_capacity[next_controller].key
+            next_controller += 1
+        else:
+            disk_ctrl_key = add_scsi_controller(
+                module, vsphere_client, config, devices, vm_hardware['scsi'], scsi_controllers[-1].busNumber + 1)
+            restart_needed = True
+            if start_key > 15:
+                start_key = 0
+    else:
+        if start_key > 0:
+            scsi_key = 1
+        disk_ctrl_key = add_scsi_controller(module, vsphere_client, config, devices, vm_hardware['scsi'], scsi_key)
+
     disk_num = start_key
-    disk_key = start_key
     for disk in sorted(vm_disk.iterkeys()):
         try:
             datastore = vm_disk[disk]['datastore']
@@ -1145,13 +1205,25 @@ def _add_vm_disks(module, vsphere_client, config, config_target, devices, vm_har
             module.fail_json(
                 msg="Error on %s definition. type needs to be"
                 " specified." % disk)
+        if disk_num == 7:
+            disk_num += 1
+        if disk_num > 15:
+            disk_num = 0
+            if next_controller < len(controller_capacity):
+                disk_ctrl_key = controller_capacity[next_controller].key
+                next_controller += 1
+            else:
+                disk_ctrl_key = add_scsi_controller(
+                    module, vsphere_client, config, devices, vm_hardware['scsi'], disk_ctrl_key + 1)
+                restart_needed = True
         # Add the disk  to the VM spec.
         add_disk(
             module, vsphere_client, config_target, config,
             devices, datastore, disktype, disksize, disk_ctrl_key,
-            disk_num, disk_key)
+            disk_num, disk_num)
         disk_num = disk_num + 1
-        disk_key = disk_key + 1
+
+    return restart_needed
 
 
 def delete_vm(vsphere_client, module, guest, vm, force):
